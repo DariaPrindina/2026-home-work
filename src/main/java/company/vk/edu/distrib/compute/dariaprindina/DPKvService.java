@@ -3,8 +3,13 @@ package company.vk.edu.distrib.compute.dariaprindina;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
+import company.vk.edu.distrib.compute.AuditableKVService;
 import company.vk.edu.distrib.compute.Dao;
-import company.vk.edu.distrib.compute.KVService;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.Producer;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.serialization.StringSerializer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -13,13 +18,23 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.util.NoSuchElementException;
 import java.util.Objects;
+import java.util.Properties;
+import java.util.concurrent.ExecutionException;
 
-public class DPKvService implements KVService {
+@SuppressWarnings({
+    "PMD.AvoidUsingVolatile",
+    "PMD.AvoidSynchronizedStatement"
+})
+public class DPKvService implements AuditableKVService {
     private static final Logger log = LoggerFactory.getLogger(DPKvService.class);
     private static final String ID_PARAM_PREFIX = "id=";
+    private static final String TOPIC_AUDIT = "audit";
 
     private final HttpServer server;
     private final Dao<byte[]> dao;
+    private volatile String bootstrapServers;
+    private volatile boolean asyncEnabled;
+    private volatile Producer<String, String> producer;
 
     public DPKvService(int port, Dao<byte[]> dao) throws IOException {
         this.server = HttpServer.create(new InetSocketAddress(port), 0);
@@ -41,6 +56,8 @@ public class DPKvService implements KVService {
             final var method = httpExchange.getRequestMethod();
             final var query = httpExchange.getRequestURI().getQuery();
             final var id = parseId(query);
+            final long timestamp = System.currentTimeMillis();
+            sendAudit(method, id, timestamp);
             if ("GET".equals(method)) {
                 final var value = dao.get(id);
                 sendResponse(httpExchange, 200, value);
@@ -56,6 +73,17 @@ public class DPKvService implements KVService {
                 sendResponse(httpExchange, 405, null);
             }
         }));
+    }
+
+    @Override
+    public void setBootstrapServers(String bootstrapServers) {
+        this.bootstrapServers = bootstrapServers;
+        resetProducer();
+    }
+
+    @Override
+    public void setAsync(boolean enabled) {
+        this.asyncEnabled = enabled;
     }
 
     private static String parseId(String query) {
@@ -74,6 +102,7 @@ public class DPKvService implements KVService {
     @Override
     public void stop() {
         server.stop(0);
+        closeProducer();
         try {
             dao.close();
         } catch (IOException e) {
@@ -112,6 +141,68 @@ public class DPKvService implements KVService {
             } catch (IOException e) {
                 sendResponse(exchange, 500, null);
             }
+        }
+    }
+
+    private void sendAudit(String method, String id, long timestamp) {
+        final Producer<String, String> localProducer = ensureProducer();
+        if (localProducer == null) {
+            return;
+        }
+        final String payload = DPKvAuditUtils.serialize(method, id, timestamp);
+        final ProducerRecord<String, String> record = new ProducerRecord<>(TOPIC_AUDIT, id, payload);
+        if (asyncEnabled) {
+            localProducer.send(record);
+            return;
+        }
+        try {
+            localProducer.send(record).get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while sending audit event", e);
+        } catch (ExecutionException e) {
+            throw new IllegalStateException("Failed to send audit event", e);
+        }
+    }
+
+    private Producer<String, String> ensureProducer() {
+        Producer<String, String> localProducer = producer;
+        if (localProducer != null) {
+            return localProducer;
+        }
+        final String servers = bootstrapServers;
+        if (servers == null || servers.isBlank()) {
+            return null;
+        }
+        synchronized (this) {
+            if (producer != null) {
+                return producer;
+            }
+            final Properties properties = new Properties();
+            properties.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, servers);
+            properties.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+            properties.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+            producer = new KafkaProducer<>(properties);
+            return producer;
+        }
+    }
+
+    private void resetProducer() {
+        synchronized (this) {
+            if (producer != null) {
+                producer.close();
+                producer = null;
+            }
+        }
+    }
+
+    private void closeProducer() {
+        synchronized (this) {
+            if (producer == null) {
+                return;
+            }
+            producer.close();
+            producer = null;
         }
     }
 }
