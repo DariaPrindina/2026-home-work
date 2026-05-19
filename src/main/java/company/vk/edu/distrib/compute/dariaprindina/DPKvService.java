@@ -19,6 +19,7 @@ import java.net.InetSocketAddress;
 import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.Properties;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.ExecutionException;
 
 @SuppressWarnings({
@@ -34,11 +35,12 @@ public class DPKvService implements AuditableKVService {
     private final Dao<byte[]> dao;
     private volatile String bootstrapServers;
     private volatile boolean asyncEnabled;
-    private volatile Producer<String, String> producer;
+    private final AtomicReference<Producer<String, String>> producerRef;
 
     public DPKvService(int port, Dao<byte[]> dao) throws IOException {
         this.server = HttpServer.create(new InetSocketAddress(port), 0);
         this.dao = dao;
+        this.producerRef = new AtomicReference<>();
         initServer();
     }
 
@@ -166,7 +168,7 @@ public class DPKvService implements AuditableKVService {
     }
 
     private Producer<String, String> ensureProducer() {
-        Producer<String, String> localProducer = producer;
+        Producer<String, String> localProducer = producerRef.get();
         if (localProducer != null) {
             return localProducer;
         }
@@ -175,34 +177,31 @@ public class DPKvService implements AuditableKVService {
             return null;
         }
         synchronized (this) {
-            if (producer != null) {
-                return producer;
+            localProducer = producerRef.get();
+            if (localProducer != null) {
+                return localProducer;
             }
             final Properties properties = new Properties();
             properties.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, servers);
             properties.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
             properties.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
-            producer = new KafkaProducer<>(properties);
-            return producer;
+            localProducer = new KafkaProducer<>(properties);
+            producerRef.set(localProducer);
+            return localProducer;
         }
     }
 
     private void resetProducer() {
-        synchronized (this) {
-            if (producer != null) {
-                producer.close();
-                producer = null;
-            }
+        final Producer<String, String> currentProducer = producerRef.getAndSet(null);
+        if (currentProducer != null) {
+            currentProducer.close();
         }
     }
 
     private void closeProducer() {
-        synchronized (this) {
-            if (producer == null) {
-                return;
-            }
-            producer.close();
-            producer = null;
+        final Producer<String, String> currentProducer = producerRef.getAndSet(null);
+        if (currentProducer != null) {
+            currentProducer.close();
         }
     }
 }

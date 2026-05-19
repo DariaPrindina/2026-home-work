@@ -15,7 +15,10 @@ import java.util.Properties;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-@SuppressWarnings("PMD.AvoidUsingVolatile")
+@SuppressWarnings({
+    "PMD.AvoidUsingVolatile",
+    "PMD.AvoidSynchronizedStatement"
+})
 public class DPAuditService implements AuditService {
     private static final String TOPIC_AUDIT = "audit";
     private static final Duration POLL_TIMEOUT = Duration.ofMillis(200);
@@ -24,6 +27,7 @@ public class DPAuditService implements AuditService {
     private final String consumerGroupId;
     private final AtomicBoolean running;
     private final List<AuditEvent> entries;
+    private final Object lifecycleLock;
 
     private volatile KafkaConsumer<String, String> consumer;
     private volatile Thread thread;
@@ -33,39 +37,42 @@ public class DPAuditService implements AuditService {
         this.consumerGroupId = consumerGroupId;
         this.running = new AtomicBoolean(false);
         this.entries = new CopyOnWriteArrayList<>();
+        this.lifecycleLock = new Object();
     }
 
     @Override
-    public synchronized void start() {
-        if (running.get()) {
-            return;
+    public void start() {
+        synchronized (lifecycleLock) {
+            if (running.get()) {
+                return;
+            }
+            running.set(true);
+            consumer = createConsumer();
+            consumer.subscribe(List.of(TOPIC_AUDIT));
+            thread = new Thread(this::pollLoop, "daria-audit-consumer-" + consumerGroupId);
+            thread.start();
         }
-        running.set(true);
-        consumer = createConsumer();
-        consumer.subscribe(List.of(TOPIC_AUDIT));
-        thread = new Thread(this::pollLoop, "daria-audit-consumer-" + consumerGroupId);
-        thread.start();
     }
 
     @Override
-    public synchronized void stop() {
-        running.set(false);
-        final Thread localThread = thread;
-        if (localThread != null) {
-            localThread.interrupt();
-            try {
-                localThread.join(Duration.ofSeconds(2).toMillis());
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+    public void stop() {
+        synchronized (lifecycleLock) {
+            running.set(false);
+            final Thread localThread = thread;
+            if (localThread != null) {
+                localThread.interrupt();
+                try {
+                    localThread.join(Duration.ofSeconds(2).toMillis());
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            final KafkaConsumer<String, String> localConsumer = consumer;
+            if (localConsumer != null) {
+                localConsumer.wakeup();
+                localConsumer.close();
             }
         }
-        final KafkaConsumer<String, String> localConsumer = consumer;
-        if (localConsumer != null) {
-            localConsumer.wakeup();
-            localConsumer.close();
-        }
-        consumer = null;
-        thread = null;
     }
 
     @Override
